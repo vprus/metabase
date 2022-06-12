@@ -9,6 +9,8 @@ ARG VERSION
 
 WORKDIR /home/node
 
+RUN apt-get update && apt-get install -y debian-archive-keyring
+RUN apt-get update && apt-get install -y ca-certificates
 RUN apt-get update && apt-get upgrade -y && apt-get install wget apt-transport-https gpg curl git -y \
     && wget -qO - https://packages.adoptium.net/artifactory/api/gpg/key/public | gpg --dearmor | tee /etc/apt/trusted.gpg.d/adoptium.gpg > /dev/null \
     && echo "deb https://packages.adoptium.net/artifactory/deb $(awk -F= '/^VERSION_CODENAME/{print$2}' /etc/os-release) main" | tee /etc/apt/sources.list.d/adoptium.list \
@@ -59,3 +61,7 @@ EXPOSE 3000
 
 # run it
 ENTRYPOINT ["/app/run_metabase.sh"]
+
+LABEL com.joom.retention.maxCount=5
+LABEL com.joom.retention.maxCountGroup=develop
+LABEL com.joom.retention.pullProtectDays=30

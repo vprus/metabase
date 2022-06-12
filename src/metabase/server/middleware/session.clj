@@ -27,7 +27,11 @@
    [metabase.premium-features.core :as premium-features]
    [metabase.request.core :as request]
    [metabase.request.schema :as request.schema]
+   [metabase.request.util :as request.u]
    [metabase.session.core :as session]
+   [metabase.session.models.session :as models.session]
+   [metabase.users.models.user :as user]
+   [metabase.util :as u]
    [metabase.util.honey-sql-2 :as h2x]
    [metabase.util.i18n :as i18n]
    [metabase.util.log :as log]
@@ -44,7 +48,10 @@
 ;;; |                                                wrap-session-key                                                 |
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
-(def ^:private ^String metabase-session-header "x-metabase-session")
+(def ^:private ^String metabase-session-header       "x-metabase-session")
+(def ^:private ^String remote-user-header            "x-remote-user")
+(def ^:private ^String remote-user-first-name-header "x-remote-user-first-name")
+(def ^:private ^String remote-user-last-name-header  "x-remote-user-last-name")
 
 (defmulti ^:private wrap-session-key-with-strategy
   "Attempt to add `:metabase-session-key` to `request` based on a specific strategy. Return modified request if
@@ -71,12 +78,30 @@
     (when (seq session)
       (assoc request :metabase-session-key session))))
 
+(defmethod wrap-session-key-with-strategy :x-remote-user
+  [_ {:keys [headers], :as request}]
+  ;; Assume that the remote user header contains email
+  (when-let [email (get headers remote-user-header)]
+    (let [user-maybe (t2/select-one [:model/User :id :last_login :first_name :last_name :is_active]
+                                    :%lower.email (u/lower-case-en email))
+          user (if user-maybe user-maybe
+                   (-> (user/create-new-ldap-auth-user! {:first_name (or (get headers remote-user-first-name-header) email)
+                                                         :last_name  (or (get headers remote-user-last-name-header) (i18n/trs "Unknown"))
+                                                         :email      email})
+                       (assoc :is_active true)))
+          {session-uuid :id, :as session} (models.session/create-session! :sso user (request.u/device-info request))
+          ;; We don't check is user is disabled or not. When using auth proxy, that's up
+          ;; to that proxy to decide.
+          metabase-session-key-hashed (session/hash-session-key session-uuid)]
+
+      (assoc request :metabase-session-key session-uuid :new-session session :metabase-session-key-hashed metabase-session-key-hashed))))
+
 (defmethod wrap-session-key-with-strategy :best
   [_ request]
   (some
    (fn [strategy]
      (wrap-session-key-with-strategy strategy request))
-   [:embedded-cookie :normal-cookie :header]))
+   [:embedded-cookie :normal-cookie :header :x-remote-user]))
 
 (defn wrap-session-key
   "Middleware that sets the `:metabase-session-key` keyword on the request if a session id can be found.
@@ -85,8 +110,14 @@
   [handler]
   (fn [request respond raise]
     (let [request (or (wrap-session-key-with-strategy :best request)
-                      request)]
-      (handler request respond raise))))
+                      request)
+          respond-with-cookie (fn [response]
+                                ;; If we have 'new-session' key in request, it means that wrap-session-key wants us to
+                                ;; set a cookie in the response.
+                                (let [new-session (get request :new-session)
+                                      new-response (if new-session (request/set-session-cookies request response new-session (t/zoned-date-time (t/zone-id "GMT"))) response)]
+                                  (respond new-response)))]
+      (handler request respond-with-cookie raise))))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                             wrap-current-user-info                                             |
