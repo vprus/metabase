@@ -43,3 +43,7 @@ EXPOSE 3000
 
 # run it
 ENTRYPOINT ["/app/run_metabase.sh"]
+
+LABEL com.joom.retention.maxCount=5
+LABEL com.joom.retention.maxCountGroup=develop
+LABEL com.joom.retention.pullProtectDays=30

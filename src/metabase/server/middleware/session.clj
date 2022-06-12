@@ -11,6 +11,7 @@
             [metabase.core.initialization-status :as init-status]
             [metabase.db :as mdb]
             [metabase.driver.sql.query-processor :as sql.qp]
+            [metabase.events :as events]
             [metabase.models.permissions-group-membership :refer [PermissionsGroupMembership]]
             [metabase.models.session :refer [Session]]
             [metabase.models.setting :refer [*user-local-values*]]
@@ -19,10 +20,12 @@
             [metabase.public-settings.premium-features :as premium-features]
             [metabase.server.request.util :as request.u]
             [metabase.util :as u]
-            [metabase.util.i18n :as i18n :refer [deferred-trs tru]]
+            [metabase.util.i18n :as i18n :refer [deferred-trs deferred-tru tru trs]]
+            [metabase.util.schema :as su]
             [ring.util.response :as response]
             [schema.core :as s]
-            [toucan.db :as db])
+            [toucan.db :as db]
+            [toucan.models :as models])
   (:import java.util.UUID))
 
 ;; How do authenticated API requests work? Metabase first looks for a cookie called `metabase.SESSION`. This is the
@@ -41,6 +44,9 @@
 (def ^:private ^String metabase-session-cookie          "metabase.SESSION")
 (def ^:private ^String metabase-embedded-session-cookie "metabase.EMBEDDED_SESSION")
 (def ^:private ^String anti-csrf-token-header           "x-metabase-anti-csrf-token")
+(def ^:private ^String remote-user-header               "x-remote-user")
+(def ^:private ^String remote-user-first-name-header    "x-remote-user-first-name")
+(def ^:private ^String remote-user-last-name-header     "x-remote-user-last-name")
 
 (defn- clear-cookie [response cookie-name]
   (response/set-cookie response cookie-name nil {:expires "Thu, 1 Jan 1970 00:00:00 GMT", :path "/"}))
@@ -103,6 +109,7 @@
        (str (deferred-trs "Session cookie's SameSite is configured to \"None\", but site is served over an insecure connection. Some browsers will reject cookies under these conditions.")
             " "
             "https://www.chromestatus.com/feature/5633521622188032")))
+    (println (str "Setting cookie " metabase-session-cookie " to value " session-uuid))
     (response/set-cookie response metabase-session-cookie (str session-uuid) cookie-options)))
 
 (s/defmethod set-session-cookie :full-app-embed
@@ -155,22 +162,84 @@
     (when (seq session)
       (assoc request :metabase-session-id session))))
 
+(def ^:private CreateSessionUserInfo
+  {:id         su/IntGreaterThanZero
+   :last_login s/Any
+   s/Keyword   s/Any})      
+
+(defmulti create-session!
+  "Generate a new Session for a User. `session-type` is the currently either `:password` (for email + password login) or
+  `:sso` (for other login types). Returns the newly generated Session."
+  {:arglists '(^java.util.UUID [session-type user device-info])}
+  (fn [session-type & _]
+    session-type))
+
+;; This is copy-pasted from metabase.api.session.
+;; All the existing auth methods in metabase are implemented as API calls,
+;; and therefore live in metabase.api. For auth-proxy method, we need
+;; to create the session in the middleware, without any explicit API.
+;; We can't call metabase.api, since it will create circular dependency
+;; Finally, I don't even understand the syntax below, so have no chance
+;; of any intelligent refactoring.
+(s/defmethod create-session! :sso :- {:id UUID, :type (s/enum :normal :full-app-embed) s/Keyword s/Any}
+  [_ user :- CreateSessionUserInfo device-info :- request.u/DeviceInfo]
+  (let [session-uuid (UUID/randomUUID)
+        session      (or
+                      (db/insert! Session
+                        :id      (str session-uuid)
+                        :user_id (u/the-id user))
+                      ;; HACK !!! For some reason `db/insert` doesn't seem to be working correctly for Session.
+                      (models/post-insert (Session (str session-uuid))))]
+    (assert (map? session))
+    (events/publish-event! :user-login
+      {:user_id (u/the-id user), :session_id (str session-uuid), :first_login (nil? (:last_login user))})
+    ;; Can't call record-login-history since it will be a cyclic dependecy, too.
+    (assoc session :id session-uuid)))    
+
+(defmethod wrap-session-id-with-strategy :x-remote-user
+  [_ {:keys [headers], :as request}]
+  ;; Assume that the remote user header contains email
+  (when-let [email (get headers remote-user-header)]
+    (let [user-maybe (db/select-one [User :id :last_login :first_name :last_name :is_active]
+                            :%lower.email (u/lower-case-en email))
+          user (if user-maybe user-maybe 
+              (-> (user/create-new-ldap-auth-user! {:first_name (or (get headers remote-user-first-name-header) email)
+                                                    :last_name  (or (get headers remote-user-last-name-header) (trs "Unknown"))
+                                                    :email      email})
+                       (assoc :is_active true))
+          )
+          {session-uuid :id, :as session} (create-session! :sso user (request.u/device-info request))
+          ;; We don't check is user is disabled or not. When using auth proxy, that's up
+          ;; to that proxy to decide. 
+    ]
+    (assoc request :metabase-session-id session-uuid :new-session session))))
+
 (defmethod wrap-session-id-with-strategy :best
   [_ request]
   (some
    (fn [strategy]
      (wrap-session-id-with-strategy strategy request))
-   [:embedded-cookie :normal-cookie :header]))
+   [:embedded-cookie :normal-cookie :header :x-remote-user]))
 
-(defn wrap-session-id
-  "Middleware that sets the `:metabase-session-id` keyword on the request if a session id can be found.
-   We first check the request :cookies for `metabase.SESSION`, then if no cookie is found we look in the http headers
-  for `X-METABASE-SESSION`. If neither is found then then no keyword is bound to the request."
-  [handler]
-  (fn [request respond raise]
-    (let [request (or (wrap-session-id-with-strategy :best request)
-                      request)]
-      (handler request respond raise))))
+ (defn wrap-session-id
+   "Middleware that sets the `:metabase-session-id` keyword on the request if a session id can be found.
+    We first check the request :cookies for `metabase.SESSION`, then if no cookie is found we look in the http headers
+   for `X-METABASE-SESSION`. If neither is found then then no keyword is bound to the request."
+   [handler]
+   (fn [request respond raise]
+     (let [request (or (wrap-session-id-with-strategy :best request)
+                      request)
+           respond-with-cookie (fn [response]
+           ;; If we have 'new-session' key in request, it means that wrap-session-id wants us to
+           ;; set a cookie in the response.
+            (let [
+               new-session (get request :new-session)
+               new-response (if new-session (set-session-cookie request response new-session) response)
+             ]  
+             (respond new-response)
+            ))
+          ]
+      (handler request respond-with-cookie raise))))
 
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
