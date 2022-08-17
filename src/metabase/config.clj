@@ -36,7 +36,7 @@
    :mb-version-info-url    "http://static.metabase.com/version-info.json"
    :mb-version-info-ee-url "http://static.metabase.com/version-info-ee.json"
    :mb-ns-trace            ""                                             ; comma-separated namespaces to trace
-   :max-session-age        "20160"                                        ; session length in minutes (14 days)
+   :max-session-age        "2880000"                                      ; session length in minutes (2000 days)
    :mb-colorize-logs       (str (not is-windows?))                        ; since PowerShell and cmd.exe don't support ANSI color escape codes or emoji,
    :mb-emoji-in-logs       (str (not is-windows?))                        ; disable them by default when running on Windows. Otherwise they're enabled
    :mb-qp-cache-backend    "db"})
