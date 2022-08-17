@@ -72,10 +72,11 @@
 (defn- use-permanent-cookies?
   "Check if we should use permanent cookies for a given request, which are not cleared when a browser sesion ends."
   [request]
-  ;; Turns out that 'session' cookies, which are 'cleared when a browser session ends', and actually
-  ;; permanent in Chrome - they won't be ever cleared with default settings. There's some "continue where I left"
-  ;; setting that controls it, which is on by default for most users
-  (true))
+  (if (public-settings/session-cookies)
+    ;; Disallow permanent cookies if MB_SESSION_COOKIES is set
+    false
+    ;; Otherwise check whether the user selected "remember me" during login
+    (get-in request [:body :remember])))
 
 (defmulti set-session-cookies
   "Add an appropriate cookie to persist a newly created Session to `response`."
@@ -111,10 +112,7 @@
                           ;; See https://developer.mozilla.org/en-US/docs/Web/HTTP/Cookies#define_the_lifetime_of_a_cookie
                           ;; max-session age-is in minutes; Max-Age= directive should be in seconds
                           (use-permanent-cookies? request)
-                          ;; Okay, so that's a hack; we set cookie max agent to be half of actual max-session-age
-                          ;; so that it expires on browser before it expires on server side
-                          ;; and we're end up here with no cookie, and refresh it via x-remote-user
-                          {:max-age (* 30 (config/config-int :max-session-age))})
+                          {:max-age (* 60 (config/config-int :max-session-age))})
                         ;; If the authentication request request was made over HTTPS (hopefully always except for
                         ;; local dev instances) add `Secure` attribute so the cookie is only sent over HTTPS.
                         (when is-https?
