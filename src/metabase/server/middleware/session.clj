@@ -255,8 +255,8 @@
           ;; set a cookie in the response.
            (let [
               new-session (get request :new-session)
-              new-response (if new-session (set-session-cookies request response new-session) response)
-            ]  
+              new-response (if new-session (set-session-cookies request response new-session (t/zoned-date-time (t/zone-id "GMT")) response)
+            ]
             (respond new-response)
            ))
          ]
